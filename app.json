@@ -1,0 +1,29 @@
+{
+  "name": "9bot-instance",
+  "description": "Personal 9Bot WhatsApp Instance",
+  "addons": [
+    { 
+      "plan": "heroku-postgresql",
+      "options": {
+        "version": "13"
+      }
+    }
+  ],
+  "buildpacks": [
+    { 
+      "url": "heroku/nodejs" 
+    }
+  ],
+  "env": {
+    "BASE64_SESSION": {
+      "description": "WhatsApp session data",
+      "required": true
+    }
+  },
+  "formation": {
+    "web": {
+      "quantity": 1,
+      "size": "eco"
+    }
+  }
+}
