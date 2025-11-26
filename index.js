@@ -1,137 +1,234 @@
 require('dotenv').config();
-const { Pool } = require('pg');
-const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const express = require('express');
 const pino = require('pino');
+const { 
+    default: makeWASocket, 
+    fetchLatestWaWebVersion, 
+    useMultiFileAuthState, 
+    makeCacheableSignalKeyStore, 
+    DisconnectReason 
+} = require('@whiskeysockets/baileys');
 
-// Database connection
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.use(express.json());
+
+// Health check
+app.get('/', (req, res) => {
+    res.json({ 
+        status: 'running', 
+        bot: '9Bot Instance',
+        deployed: true 
+    });
 });
 
-// Command usage tracking
-class CommandManager {
-  constructor(userId) {
-    this.userId = userId;
-    this.freeLimit = 5;
-  }
+app.listen(PORT, () => {
+    console.log(`🚀 9Bot instance running on port ${PORT}`);
+});
 
-  async canUseCommand(commandName) {
-    const result = await pool.query(
-      'SELECT usage_count FROM command_usage WHERE user_id = $1 AND command_name = $1',
-      [this.userId, commandName]
-    );
-
-    if (result.rows.length === 0) {
-      await pool.query(
-        'INSERT INTO command_usage (user_id, command_name, usage_count) VALUES ($1, $2, $3)',
-        [this.userId, commandName, 1]
-      );
-      return true;
+// Session import function
+function importBase64Session(sessionName, base64Session) {
+    const fs = require('fs');
+    const path = require('path');
+    
+    try {
+        const sessionDir = path.join(__dirname, 'sessions', sessionName);
+        
+        // Create session directory
+        if (!fs.existsSync(sessionDir)) {
+            fs.mkdirSync(sessionDir, { recursive: true });
+        }
+        
+        // Decode base64 session
+        const sessionData = JSON.parse(Buffer.from(base64Session, 'base64').toString());
+        
+        // Write creds.json
+        fs.writeFileSync(path.join(sessionDir, 'creds.json'), JSON.stringify(sessionData, null, 2));
+        
+        console.log('✅ Session imported from environment');
+        return true;
+    } catch (error) {
+        console.error('❌ Session import failed:', error.message);
+        return false;
     }
+}
 
-    const usage = result.rows[0].usage_count;
-    if (usage >= this.freeLimit) {
-      return false;
+// Command handler
+const commands = {
+    test: {
+        handler: async (client, message) => {
+            const jid = message.key.remoteJid;
+            await client.sendMessage(jid, { 
+                text: `✅ 9Bot is working!\n\nThis is your personal bot instance.\n\nTry !menu for more commands.` 
+            }, { quoted: message });
+        }
+    },
+    
+    menu: {
+        handler: async (client, message) => {
+            const jid = message.key.remoteJid;
+            const menuText = `
+*🤖 9BOT COMMANDS*
+
+!test - Test if bot is working
+!menu - Show this menu
+!info - Bot information
+
+*🎯 FREE TIER*
+• 5 uses per command
+• Reset daily
+
+💎 Upgrade: https://9bot.com.br
+
+🤖 Powered by 9Bot`;
+
+            await client.sendMessage(jid, { text: menuText }, { quoted: message });
+        }
+    },
+    
+    info: {
+        handler: async (client, message) => {
+            const jid = message.key.remoteJid;
+            await client.sendMessage(jid, { 
+                text: `*🤖 9BOT INFORMATION*\n\n• Tier: FREE\n• Commands: 5 uses each\n• Status: Active\n\n💎 Upgrade for unlimited commands at:\nhttps://9bot.com.br` 
+            }, { quoted: message });
+        }
     }
+};
 
-    await pool.query(
-      'UPDATE command_usage SET usage_count = $1 WHERE user_id = $2 AND command_name = $3',
-      [usage + 1, this.userId, commandName]
-    );
+// Track command usage (simple in-memory for free tier)
+const commandUsage = new Map();
+const FREE_LIMIT = 5;
 
-    return true;
-  }
-
-  async getRemainingCommands(commandName) {
-    const result = await pool.query(
-      'SELECT usage_count FROM command_usage WHERE user_id = $1 AND command_name = $1',
-      [this.userId, commandName]
-    );
-
-    if (result.rows.length === 0) {
-      return this.freeLimit;
+function canUseCommand(userJid, command) {
+    const key = `${userJid}-${command}`;
+    const today = new Date().toDateString();
+    const usageKey = `${key}-${today}`;
+    
+    const usage = commandUsage.get(usageKey) || 0;
+    
+    if (usage >= FREE_LIMIT) {
+        return { canUse: false, remaining: 0 };
     }
-
-    return this.freeLimit - result.rows[0].usage_count;
-  }
+    
+    commandUsage.set(usageKey, usage + 1);
+    return { canUse: true, remaining: FREE_LIMIT - (usage + 1) };
 }
 
 // Initialize bot
-async function startBot() {
-  const sessionData = process.env.BASE64_SESSION;
-  const phone = process.env.PHONE_NUMBER;
+let isBotRunning = false;
 
-  if (!sessionData) {
-    console.log('❌ No session data found');
-    return;
-  }
+(async () => {
+    if (isBotRunning) return;
+    isBotRunning = true;
 
-  try {
-    const { state, saveCreds } = await useMultiFileAuthState('./session');
-    const { version } = await fetchLatestBaileysVersion();
+    const logger = pino({ level: 'silent' });
+    const SESSION_NAME = '9bot-session';
+    const BASE64_SESSION = process.env.BASE64_SESSION;
 
-    const sock = makeWASocket({
-      version,
-      logger: pino({ level: 'silent' }),
-      auth: state,
-      printQRInTerminal: false,
-    });
+    console.log('🚀 Starting 9Bot Instance...');
+    console.log('📦 Using template: https://github.com/xhclintohn/9bot-template');
 
-    sock.ev.on('creds.update', saveCreds);
+    // Import session from environment
+    if (BASE64_SESSION) {
+        console.log('📥 Importing session...');
+        importBase64Session(SESSION_NAME, BASE64_SESSION);
+    } else {
+        console.log('❌ No session found in environment');
+        return;
+    }
 
-    sock.ev.on('messages.upsert', async ({ messages }) => {
-      const message = messages[0];
-      if (!message.message || message.key.fromMe) return;
+    let client;
 
-      const jid = message.key.remoteJid;
-      const text = message.message.conversation || '';
+    async function initializeBot() {
+        try {
+            const { version } = await fetchLatestWaWebVersion();
+            const { state, saveCreds } = await useMultiFileAuthState(`./sessions/${SESSION_NAME}`);
 
-      if (text.startsWith('!')) {
-        const command = text.split(' ')[0].substring(1);
-        const userManager = new CommandManager(phone);
+            client = makeWASocket({
+                printQRInTerminal: false, // No QR needed - we use session
+                syncFullHistory: false,
+                markOnlineOnConnect: true,
+                connectTimeoutMs: 60000,
+                version,
+                logger,
+                auth: {
+                    creds: state.creds,
+                    keys: makeCacheableSignalKeyStore(state.keys, logger)
+                }
+            });
 
-        if (!(await userManager.canUseCommand(command))) {
-          const remaining = await userManager.getRemainingCommands(command);
-          await sock.sendMessage(jid, {
-            text: `❌ Free trial limit reached!\n\nYou've used all ${process.env.FREE_COMMAND_LIMIT} free uses of !${command}.\n\n💎 Upgrade to premium at: https://9bot.com.br\n\nRemaining free commands: ${remaining}`
-          });
-          return;
+            client.ev.on('creds.update', saveCreds);
+
+            client.ev.on('connection.update', (update) => {
+                const { connection, lastDisconnect } = update;
+
+                if (connection === 'close') {
+                    const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+                    console.log(`🔌 Connection closed, reconnecting: ${shouldReconnect}`);
+
+                    if (shouldReconnect) {
+                        setTimeout(initializeBot, 5000);
+                    }
+                } else if (connection === 'open') {
+                    console.log('✅ WhatsApp connected successfully!');
+                    
+                    // Send welcome message to user
+                    setTimeout(async () => {
+                        try {
+                            await client.sendMessage(client.user.id, {
+                                text: `🎉 Your 9Bot is ready!\n\nSend !menu to see all commands.\n\n🤖 Free tier: 5 uses per command\n💎 Upgrade: https://9bot.com.br`
+                            });
+                        } catch (error) {
+                            console.log('Welcome message sent');
+                        }
+                    }, 2000);
+                }
+            });
+
+            client.ev.on('messages.upsert', async (m) => {
+                const message = m.messages[0];
+
+                if (!message.message || message.key.fromMe) return;
+
+                const jid = message.key.remoteJid;
+                const text = (message.message?.conversation || '').trim();
+
+                if (!text || !text.startsWith('!')) return;
+
+                const command = text.substring(1).toLowerCase().split(' ')[0];
+                
+                if (commands[command]) {
+                    console.log(`⚡ Command: !${command} from ${jid}`);
+                    
+                    // Check usage limits
+                    const usageCheck = canUseCommand(jid, command);
+                    
+                    if (!usageCheck.canUse) {
+                        await client.sendMessage(jid, {
+                            text: `❌ Free limit reached!\n\nYou've used all 5 free uses of !${command} today.\n\n💎 Upgrade for unlimited commands:\nhttps://9bot.com.br\n\n🕒 Limits reset daily.`
+                        }, { quoted: message });
+                        return;
+                    }
+
+                    // Execute command
+                    try {
+                        await commands[command].handler(client, message);
+                    } catch (error) {
+                        console.error(`Command error:`, error);
+                        await client.sendMessage(jid, {
+                            text: `❌ Error: ${error.message}`
+                        }, { quoted: message });
+                    }
+                }
+            });
+
+        } catch (error) {
+            console.error('❌ Bot init error:', error);
+            setTimeout(initializeBot, 10000);
         }
+    }
 
-        // Handle command here
-        await handleCommand(sock, message, command, userManager);
-      }
-    });
-
-    console.log('✅ 9Bot Free instance started');
-  } catch (error) {
-    console.error('Bot startup error:', error);
-  }
-}
-
-async function handleCommand(sock, message, command, userManager) {
-  const jid = message.key.remoteJid;
-  
-  switch (command) {
-    case 'menu':
-      const remaining = await userManager.getRemainingCommands('menu');
-      await sock.sendMessage(jid, {
-        text: `🤖 9Bot Menu (Free Tier)\n\nAvailable commands:\n!menu - Show this menu\n!info - Bot information\n\n📊 Free usage: ${remaining}/${process.env.FREE_COMMAND_LIMIT} commands left\n\n💎 Upgrade: https://9bot.com.br`
-      });
-      break;
-    
-    case 'info':
-      await sock.sendMessage(jid, {
-        text: `ℹ️ 9Bot Information\n\nTier: FREE\nCommands Limit: ${process.env.FREE_COMMAND_LIMIT} per command\n\nVisit https://9bot.com.br to upgrade!`
-      });
-      break;
-    
-    default:
-      await sock.sendMessage(jid, {
-        text: `❌ Unknown command: !${command}\n\nType !menu for available commands.`
-      });
-  }
-}
-
-startBot();
+    await initializeBot();
+})();
